@@ -126,6 +126,41 @@ app.post('/sessions/:id/upload', authenticateREST, async (req, res) => {
   }
 });
 
+// ── HTTP: Format Code ──
+app.post('/sessions/:id/format', authenticateREST, async (req, res) => {
+  const { id } = req.params;
+  const { filename, language } = req.body;
+  const session = activeSessions[id];
+  
+  if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
+  if (!filename || filename.includes('..') || path.isAbsolute(filename)) return res.status(400).json({ error: 'Invalid filename' });
+
+  // Strict validation against shell injection
+  const safePath = path.normalize(filename).replace(/^(\.\.[\/\\])+/, '');
+  if (!/^[a-zA-Z0-9_\-\.\/]+$/.test(safePath)) {
+    return res.status(400).json({ error: 'Invalid filename characters' });
+  }
+
+  if (language === 'python') {
+    const userWorkspace = path.join(BASE_WORKSPACE, session.userId);
+    const filePath = path.join(userWorkspace, safePath);
+
+    try {
+      // Prioritize black, fallback to autopep8
+      const formatCmd = `docker exec ${session.containerId} bash -c "if command -v black &> /dev/null; then black /workspace/${safePath}; elif command -v autopep8 &> /dev/null; then autopep8 --in-place /workspace/${safePath}; else exit 1; fi"`;
+      execSync(formatCmd);
+      
+      const formattedContent = await fs.readFile(filePath, 'utf8');
+      session.previewVersion = (session.previewVersion || 0) + 1; // Bump live-reload
+      res.json({ success: true, content: formattedContent });
+    } catch (e) {
+      res.status(500).json({ error: 'Formatter failed to execute or format.' });
+    }
+  } else {
+    res.status(400).json({ error: 'Formatting only supported for Python.' });
+  }
+});
+
 // ── Preview & Live Reload Routes ──
 app.get('/sessions/:id/preview/*', async (req, res) => {
   const { id } = req.params;

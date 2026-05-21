@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     bash \
     curl \
     xz-utils \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install modern Node.js (Node 18 LTS) from official pre-compiled binaries

@@ -8,11 +8,11 @@ const path = require('path');
 const fs = require('fs-extra');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { execSync, exec } = require('child_process');
+const { execSync, exec, spawn } = require('child_process');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '50mb' })); // Allow medium-sized uploads
+app.use(express.json({ limit: '50mb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
@@ -23,11 +23,8 @@ const BASE_WORKSPACE = path.join(__dirname, '../workspace');
 
 fs.ensureDirSync(BASE_WORKSPACE);
 
-// Session State Tracking
-// Format: { sessionId: { containerId, userId, lastActiveTime, startTime, ptyProcess } }
 const activeSessions = {};
 
-// ── Auth Middleware ──
 const authenticateREST = (req, res, next) => {
   const token = req.headers['x-auth-token'] || req.query.token;
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -44,7 +41,6 @@ const authenticateREST = (req, res, next) => {
   }
 };
 
-// ── HTTP: Spawn Session ──
 app.post('/sessions', authenticateREST, (req, res) => {
   const userId = req.user.userId;
   const sessionId = crypto.randomUUID();
@@ -54,8 +50,9 @@ app.post('/sessions', authenticateREST, (req, res) => {
   fs.ensureDirSync(userWorkspace);
 
   try {
-    // Spawn container with strict limits, mapped workspace, read-only root, and writable /home/student
-    const cmd = `docker run -d --name ${containerId} --rm --memory=256m --memory-swap=256m --cpus=0.5 --pids-limit=50 --network=none --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -v ${userWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
+    // Removed --network=none to allow package downloads
+    // Added PIP_TARGET and PYTHONPATH to install and run packages inside a shared workspace folder
+    const cmd = `docker run -d --name ${containerId} --rm --memory=256m --memory-swap=256m --cpus=0.5 --pids-limit=50 --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${userWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
     
     execSync(cmd);
     
@@ -77,37 +74,24 @@ app.post('/sessions', authenticateREST, (req, res) => {
   }
 });
 
-// ── HTTP: Terminate Session ──
 app.delete('/sessions/:id', authenticateREST, (req, res) => {
   const { id } = req.params;
   const session = activeSessions[id];
   
-  if (!session || session.userId !== req.user.userId) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
+  if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
   
-  try {
-    execSync(`docker rm -f ${session.containerId}`);
-  } catch (e) {
-    console.error(`[Nova Engine] Failed to remove container ${session.containerId}:`, e.message);
-  }
-  
+  try { execSync(`docker rm -f ${session.containerId}`); } catch (e) {}
   if (session.ptyProcess) session.ptyProcess.kill();
   delete activeSessions[id];
   res.json({ success: true });
 });
 
-// ── HTTP: Safe Upload ──
 app.post('/sessions/:id/upload', authenticateREST, async (req, res) => {
   const { id } = req.params;
   const { filename, content } = req.body;
   const session = activeSessions[id];
   
-  if (!session || session.userId !== req.user.userId) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  // Protect against directory traversal and bad filenames
+  if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
   if (!filename || filename.includes('..') || filename.includes('\0') || path.isAbsolute(filename)) {
     return res.status(400).json({ error: 'Invalid filename' });
   }
@@ -119,14 +103,13 @@ app.post('/sessions/:id/upload', authenticateREST, async (req, res) => {
   try {
     await fs.ensureDir(path.dirname(filePath));
     await fs.writeFile(filePath, content || '', 'utf8');
-    session.previewVersion = (session.previewVersion || 0) + 1; // Bump version for live reload
+    session.previewVersion = (session.previewVersion || 0) + 1;
     res.json({ success: true, filename: safePath });
   } catch (err) {
     res.status(500).json({ error: 'Failed to write file to host map' });
   }
 });
 
-// ── HTTP: Format Code ──
 app.post('/sessions/:id/format', authenticateREST, async (req, res) => {
   const { id } = req.params;
   const { filename, language } = req.body;
@@ -135,23 +118,19 @@ app.post('/sessions/:id/format', authenticateREST, async (req, res) => {
   if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
   if (!filename || filename.includes('..') || path.isAbsolute(filename)) return res.status(400).json({ error: 'Invalid filename' });
 
-  // Strict validation against shell injection
   const safePath = path.normalize(filename).replace(/^(\.\.[\/\\])+/, '');
-  if (!/^[a-zA-Z0-9_\-\.\/]+$/.test(safePath)) {
-    return res.status(400).json({ error: 'Invalid filename characters' });
-  }
+  if (!/^[a-zA-Z0-9_\-\.\/]+$/.test(safePath)) return res.status(400).json({ error: 'Invalid filename characters' });
 
   if (language === 'python') {
     const userWorkspace = path.join(BASE_WORKSPACE, session.userId);
     const filePath = path.join(userWorkspace, safePath);
 
     try {
-      // Prioritize black, fallback to autopep8
       const formatCmd = `docker exec ${session.containerId} bash -c "if command -v black &> /dev/null; then black /workspace/${safePath}; elif command -v autopep8 &> /dev/null; then autopep8 --in-place /workspace/${safePath}; else exit 1; fi"`;
       execSync(formatCmd);
       
       const formattedContent = await fs.readFile(filePath, 'utf8');
-      session.previewVersion = (session.previewVersion || 0) + 1; // Bump live-reload
+      session.previewVersion = (session.previewVersion || 0) + 1;
       res.json({ success: true, content: formattedContent });
     } catch (e) {
       res.status(500).json({ error: 'Formatter failed to execute or format.' });
@@ -161,7 +140,87 @@ app.post('/sessions/:id/format', authenticateREST, async (req, res) => {
   }
 });
 
-// ── Preview & Live Reload Routes ──
+// ── HTTP: Exec Command (SSE Streaming) ──
+app.post('/sessions/:id/exec', authenticateREST, (req, res) => {
+  const { id } = req.params;
+  const { command } = req.body;
+  const session = activeSessions[id];
+  
+  if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
+  if (!command) return res.status(400).json({ error: 'Command required' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const execProcess = spawn('docker', ['exec', session.containerId, 'bash', '-c', command]);
+
+  execProcess.stdout.on('data', (data) => {
+    const lines = data.toString().split('\n');
+    for (const line of lines) {
+      if (line.trim()) res.write(`data: ${JSON.stringify({ text: line })}\n\n`);
+    }
+  });
+
+  execProcess.stderr.on('data', (data) => {
+    const lines = data.toString().split('\n');
+    for (const line of lines) {
+      if (line.trim()) res.write(`data: ${JSON.stringify({ text: line })}\n\n`);
+    }
+  });
+
+  execProcess.on('close', (code) => {
+    res.write(`data: ${JSON.stringify({ text: `Process exited with code ${code}` })}\n\n`);
+    res.write('event: done\ndata: {}\n\n');
+    res.end();
+  });
+});
+
+app.get('/sessions/:id/packages', authenticateREST, async (req, res) => {
+  const { id } = req.params;
+  const session = activeSessions[id];
+  if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
+
+  const userWorkspace = path.join(BASE_WORKSPACE, session.userId);
+  
+  try {
+    const packages = { npm: [], pip: [] };
+
+    // Read npm packages from package.json
+    const pkgJsonPath = path.join(userWorkspace, 'package.json');
+    if (fs.existsSync(pkgJsonPath)) {
+      const pkg = await fs.readJson(pkgJsonPath);
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      packages.npm = Object.keys(deps).map(key => ({
+        id: key, name: key, version: deps[key] || 'installed', description: 'Installed via package.json'
+      }));
+    }
+
+    // Read pip packages from .python_packages directory
+    const pipDir = path.join(userWorkspace, '.python_packages');
+    if (fs.existsSync(pipDir)) {
+      const items = await fs.readdir(pipDir);
+      const dirs = [];
+      for (const item of items) {
+        const itemPath = path.join(pipDir, item);
+        const stat = await fs.stat(itemPath);
+        if (stat.isDirectory() && !item.includes('.dist-info') && !item.includes('__pycache__') && item !== 'bin') {
+          dirs.push({
+            id: item, name: item, version: 'installed', description: 'Local package'
+          });
+        }
+      }
+      packages.pip = dirs;
+    }
+
+    res.json(packages);
+  } catch (err) {
+    console.error('[Nova Engine] Failed to read packages:', err);
+    res.status(500).json({ error: 'Failed to list packages' });
+  }
+});
+
 app.get('/sessions/:id/preview/*', async (req, res) => {
   const { id } = req.params;
   const session = activeSessions[id];
@@ -175,13 +234,10 @@ app.get('/sessions/:id/preview/*', async (req, res) => {
   if (!filePath.startsWith(userWorkspace)) return res.status(403).send('Forbidden');
   if (!fs.existsSync(filePath)) return res.status(404).send(`File not found: ${safePath}`);
 
-  // Handle directory requests by appending index.html
   const stat = await fs.stat(filePath);
   if (stat.isDirectory()) {
     filePath = path.join(filePath, 'index.html');
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).send('<h2>index.html not found</h2>');
-    }
+    if (!fs.existsSync(filePath)) return res.status(404).send('<h2>index.html not found</h2>');
   }
 
   if (filePath.endsWith('.html') || filePath.endsWith('.htm')) {
@@ -260,111 +316,60 @@ app.delete('/sessions/:id/console', (req, res) => {
   res.json({ success: true });
 });
 
-// ── Idle Watchdog ──
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(activeSessions)) {
-    const isIdle = now - session.lastActiveTime > 30 * 60000;      // 30 min idle
-    const isExpired = now - session.startTime > 2 * 3600000;       // 2 hours absolute cap
+    const isIdle = now - session.lastActiveTime > 30 * 60000;
+    const isExpired = now - session.startTime > 2 * 3600000;
     
     if (isIdle || isExpired) {
-      console.log(`[Watchdog] Terminating session ${id} (Idle: ${isIdle}, Expired: ${isExpired})`);
-      try {
-        exec(`docker rm -f ${session.containerId}`);
-      } catch(e) {}
+      try { exec(`docker rm -f ${session.containerId}`); } catch(e) {}
       if (session.ptyProcess) session.ptyProcess.kill();
       delete activeSessions[id];
     }
   }
-}, 60000); // Check every minute
+}, 60000);
 
-// ── WebSocket Upgrade ──
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
   const token = url.searchParams.get('token') || request.headers['x-auth-token'];
-  
   const match = url.pathname.match(/^\/sessions\/([^\/]+)\/terminal$/);
-  if (!match) {
-    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-  const sessionId = match[1];
-
-  if (!token) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-    socket.destroy();
-    return;
-  }
+  
+  if (!match) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); return socket.destroy(); }
+  if (!token) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); return socket.destroy(); }
 
   try {
-    let userPayload;
-    if (token === 'nova-super-secret-token') {
-      userPayload = { userId: 'local-student' };
-    } else {
-      userPayload = jwt.verify(token, JWT_SECRET);
-    }
-    
-    request.user = userPayload;
-    request.sessionId = sessionId;
-    
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
-    });
+    request.user = token === 'nova-super-secret-token' ? { userId: 'local-student' } : jwt.verify(token, JWT_SECRET);
+    request.sessionId = match[1];
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
   } catch (err) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     socket.destroy();
   }
 });
 
-// ── WebSocket Connection logic ──
 wss.on('connection', (ws, request) => {
-  const { userId } = request.user;
-  const { sessionId } = request;
-  const session = activeSessions[sessionId];
-  
-  if (!session || session.userId !== userId) {
-    ws.send(JSON.stringify({ type: 'output', data: '\r\nSession invalid or unauthorized.\r\n' }));
-    ws.close();
-    return;
-  }
+  const session = activeSessions[request.sessionId];
+  if (!session || session.userId !== request.user.userId) return ws.close();
   
   session.lastActiveTime = Date.now();
 
-  // Exec bash inside the existing container
-  const ptyProcess = pty.spawn('docker', ['exec', '-it', session.containerId, '/bin/bash'], {
-    name: 'xterm-color',
-    cols: 80,
-    rows: 24,
-  });
-  
+  const ptyProcess = pty.spawn('docker', ['exec', '-it', session.containerId, '/bin/bash'], { cols: 80, rows: 24 });
   session.ptyProcess = ptyProcess;
 
-  ptyProcess.onData((data) => {
-    ws.send(JSON.stringify({ type: 'output', data }));
-  });
-
-  ws.on('message', (message) => {
+  ptyProcess.onData(data => ws.send(JSON.stringify({ type: 'output', data })));
+  ws.on('message', message => {
     session.lastActiveTime = Date.now();
     try {
       const payload = JSON.parse(message);
-      if (payload.type === 'input') {
-        ptyProcess.write(payload.data);
-      } else if (payload.type === 'resize') {
-        ptyProcess.resize(payload.cols || 80, payload.rows || 24);
-      }
-    } catch (err) {
-      console.error('[Nova Engine] Failed to handle WS message:', err);
-    }
+      if (payload.type === 'input') ptyProcess.write(payload.data);
+      else if (payload.type === 'resize') ptyProcess.resize(payload.cols || 80, payload.rows || 24);
+    } catch (err) {}
   });
-
   ws.on('close', () => {
-    console.log(`[Nova Engine] Terminal disconnected for session: ${sessionId}`);
     ptyProcess.kill();
     session.ptyProcess = null;
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`[Nova Engine] Active and running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`[Nova Engine] Active and running on port ${PORT}`));

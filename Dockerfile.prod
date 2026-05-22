@@ -34,9 +34,7 @@ COPY --from=builder /usr/src/app/src ./src
 EXPOSE 3000
 EXPOSE 9090
 
-# Run as non-root user
-USER node
-
+# Run as root user to enable docker socket control and workspace mounting
 ENV PORT=3000
 ENV LOG_FORMAT=json
 

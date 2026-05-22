@@ -14,6 +14,7 @@ services:
       - CONTAINER_MEMORY_MB=256
       - CONTAINER_CPUS=0.5
       - CONTAINER_PIDS_LIMIT=50
+      - HOST_WORKSPACE_DIR=/home/ubuntu/nova-engine/workspace
     volumes:
       # Mount the Docker socket so the engine can manage sandbox containers on the host
       - /var/run/docker.sock:/var/run/docker.sock

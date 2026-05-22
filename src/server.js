@@ -106,13 +106,17 @@ app.post('/sessions', authenticateREST, (req, res) => {
   fs.ensureDirSync(userWorkspace);
   fs.chmodSync(userWorkspace, 0o777);
 
+  const hostWorkspace = process.env.HOST_WORKSPACE_DIR
+    ? path.join(process.env.HOST_WORKSPACE_DIR, userId)
+    : userWorkspace;
+
   // Resource limits from environment variables
   const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY_MB ? `${process.env.CONTAINER_MEMORY_MB}m` : '256m';
   const CONTAINER_CPUS = process.env.CONTAINER_CPUS || '0.5';
   const CONTAINER_PIDS = process.env.CONTAINER_PIDS_LIMIT || '50';
 
   try {
-    const cmd = `docker run -d --name ${containerId} --rm --memory=${CONTAINER_MEMORY} --memory-swap=${CONTAINER_MEMORY} --cpus=${CONTAINER_CPUS} --pids-limit=${CONTAINER_PIDS} --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${userWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
+    const cmd = `docker run -d --name ${containerId} --rm --memory=${CONTAINER_MEMORY} --memory-swap=${CONTAINER_MEMORY} --cpus=${CONTAINER_CPUS} --pids-limit=${CONTAINER_PIDS} --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${hostWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
     
     const startSpawn = Date.now();
     execSync(cmd);

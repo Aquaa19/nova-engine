@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - JWT_SECRET=${JWT_SECRET}
+      - LOG_FORMAT=json
+      - CONTAINER_MEMORY_MB=256
+      - CONTAINER_CPUS=0.5
+      - CONTAINER_PIDS_LIMIT=50
+    volumes:
+      # Mount the Docker socket so the engine can manage sandbox containers on the host
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Map the persistent workspaces folder
+      - ./workspace:/usr/src/app/workspace
+    # Grant docker socket access to the node user via the root group privilege mapping
+    group_add:
+      - "0"
+    restart: unless-stopped

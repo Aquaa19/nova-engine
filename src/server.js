@@ -9,10 +9,66 @@ const fs = require('fs-extra');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { execSync, exec, spawn } = require('child_process');
+const client = require('prom-client');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
+
+// Version constant and header middleware
+const ENGINE_VERSION = '1.2.0';
+app.use((req, res, next) => {
+  res.setHeader('X-Nova-Engine-Version', ENGINE_VERSION);
+  next();
+});
+
+// JSON Logger Setup
+const LOG_FORMAT = process.env.LOG_FORMAT || 'text';
+function log(level, event, extra = {}) {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    level,
+    event,
+    ...extra
+  };
+  if (LOG_FORMAT === 'json') {
+    console.log(JSON.stringify(payload));
+  } else {
+    const { userId, sessionId, durationMs, error } = extra;
+    let details = '';
+    if (userId) details += ` | user: ${userId}`;
+    if (sessionId) details += ` | session: ${sessionId}`;
+    if (durationMs) details += ` | took: ${durationMs}ms`;
+    if (error) details += ` | error: ${error}`;
+    console.log(`[${payload.timestamp}] [${level.toUpperCase()}] ${event}${details}`);
+  }
+}
+
+// Prometheus Setup
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+
+const activeSessionsGauge = new client.Gauge({
+  name: 'nova_sessions_active',
+  help: 'Number of active sandbox sessions',
+  registers: [register]
+});
+const totalSessionsCounter = new client.Counter({
+  name: 'nova_sessions_total',
+  help: 'Total number of sessions created',
+  registers: [register]
+});
+const containerSpawnDurationHistogram = new client.Histogram({
+  name: 'nova_container_spawn_duration_ms',
+  help: 'Duration of docker container spawning in ms',
+  registers: [register]
+});
+const errorsCounter = new client.Counter({
+  name: 'nova_errors_total',
+  help: 'Total number of server-side errors',
+  labelNames: ['type'],
+  registers: [register]
+});
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
@@ -49,12 +105,18 @@ app.post('/sessions', authenticateREST, (req, res) => {
   
   fs.ensureDirSync(userWorkspace);
 
+  // Resource limits from environment variables
+  const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY_MB ? `${process.env.CONTAINER_MEMORY_MB}m` : '256m';
+  const CONTAINER_CPUS = process.env.CONTAINER_CPUS || '0.5';
+  const CONTAINER_PIDS = process.env.CONTAINER_PIDS_LIMIT || '50';
+
   try {
-    // Removed --network=none to allow package downloads
-    // Added PIP_TARGET and PYTHONPATH to install and run packages inside a shared workspace folder
-    const cmd = `docker run -d --name ${containerId} --rm --memory=256m --memory-swap=256m --cpus=0.5 --pids-limit=50 --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${userWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
+    const cmd = `docker run -d --name ${containerId} --rm --memory=${CONTAINER_MEMORY} --memory-swap=${CONTAINER_MEMORY} --cpus=${CONTAINER_CPUS} --pids-limit=${CONTAINER_PIDS} --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${userWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
     
+    const startSpawn = Date.now();
     execSync(cmd);
+    const spawnDuration = Date.now() - startSpawn;
+    containerSpawnDurationHistogram.observe(spawnDuration);
     
     activeSessions[sessionId] = {
       containerId,
@@ -66,10 +128,14 @@ app.post('/sessions', authenticateREST, (req, res) => {
       consoleLogs: []
     };
     
-    console.log(`[Nova Engine] Session created: ${sessionId} for user ${userId}`);
+    totalSessionsCounter.inc();
+    activeSessionsGauge.set(Object.keys(activeSessions).length);
+
+    log('info', 'Session created', { sessionId, userId, durationMs: spawnDuration });
     res.json({ sessionId, containerId });
   } catch (err) {
-    console.error('[Nova Engine] Failed to spawn sandbox:', err);
+    errorsCounter.inc({ type: 'spawn_sandbox_failed' });
+    log('error', 'Failed to spawn sandbox', { userId, error: err.message });
     res.status(500).json({ error: 'Failed to create sandbox session' });
   }
 });
@@ -216,8 +282,28 @@ app.get('/sessions/:id/packages', authenticateREST, async (req, res) => {
 
     res.json(packages);
   } catch (err) {
-    console.error('[Nova Engine] Failed to read packages:', err);
+    log('error', 'Failed to read packages', { sessionId: id, error: err.message });
     res.status(500).json({ error: 'Failed to list packages' });
+  }
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    activeSessions: Object.keys(activeSessions).length,
+    containerPoolSize: Object.keys(activeSessions).length,
+    uptime: Math.floor(process.uptime()),
+    version: ENGINE_VERSION
+  });
+});
+
+app.get('/metrics', async (req, res) => {
+  try {
+    activeSessionsGauge.set(Object.keys(activeSessions).length);
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  } catch (err) {
+    res.status(500).end(err);
   }
 });
 
@@ -372,4 +458,43 @@ wss.on('connection', (ws, request) => {
   });
 });
 
-server.listen(PORT, () => console.log(`[Nova Engine] Active and running on port ${PORT}`));
+let isShuttingDown = false;
+const gracefulShutdown = (signal) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  
+  log('info', `Received signal ${signal}, initiating graceful shutdown...`);
+
+  server.close(async () => {
+    log('info', 'HTTP/WS server closed. Cleaning up docker containers...');
+    
+    const sessionIds = Object.keys(activeSessions);
+    const cleanupPromises = sessionIds.map(sessionId => {
+      const session = activeSessions[sessionId];
+      log('info', 'Killing container', { sessionId, containerId: session.containerId });
+      
+      return new Promise((resolve) => {
+        exec(`docker rm -f ${session.containerId}`, () => {
+          if (session.ptyProcess) {
+            try { session.ptyProcess.kill(); } catch (e) {}
+          }
+          resolve();
+        });
+      });
+    });
+
+    await Promise.all(cleanupPromises);
+    log('info', 'All docker containers cleaned up successfully. Exiting.');
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    log('error', 'Force shutdown timed out. Exiting immediately.');
+    process.exit(1);
+  }, 30000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+server.listen(PORT, () => log('info', `Nova Engine active and running on port ${PORT}`, { port: PORT }));

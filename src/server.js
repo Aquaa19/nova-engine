@@ -104,6 +104,7 @@ app.post('/sessions', authenticateREST, (req, res) => {
   const userWorkspace = path.join(BASE_WORKSPACE, userId);
   
   fs.ensureDirSync(userWorkspace);
+  fs.chmodSync(userWorkspace, 0o777);
 
   // Resource limits from environment variables
   const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY_MB ? `${process.env.CONTAINER_MEMORY_MB}m` : '256m';

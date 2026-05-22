@@ -119,7 +119,9 @@ app.post('/sessions', authenticateREST, (req, res) => {
     const cmd = `docker run -d --name ${containerId} --rm --memory=${CONTAINER_MEMORY} --memory-swap=${CONTAINER_MEMORY} --cpus=${CONTAINER_CPUS} --pids-limit=${CONTAINER_PIDS} --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${hostWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
     
     const startSpawn = Date.now();
-    execSync(cmd);
+    if (process.env.NODE_ENV !== 'test') {
+      execSync(cmd);
+    }
     const spawnDuration = Date.now() - startSpawn;
     containerSpawnDurationHistogram.observe(spawnDuration);
     

@@ -104,7 +104,11 @@ app.post('/sessions', authenticateREST, (req, res) => {
   const userWorkspace = path.join(BASE_WORKSPACE, userId);
   
   fs.ensureDirSync(userWorkspace);
-  fs.chmodSync(userWorkspace, 0o777);
+  fs.chmodSync(userWorkspace, 0o755);
+
+  const pythonPackagesPath = path.join(userWorkspace, '.python_packages');
+  fs.ensureDirSync(pythonPackagesPath);
+  fs.chmodSync(pythonPackagesPath, 0o777);
 
   const hostWorkspace = process.env.HOST_WORKSPACE_DIR
     ? path.join(process.env.HOST_WORKSPACE_DIR, userId)
@@ -175,6 +179,14 @@ app.post('/sessions/:id/upload', authenticateREST, async (req, res) => {
   
   try {
     await fs.ensureDir(path.dirname(filePath));
+    
+    // Ensure all created project directories are writable by the container student user (0o777)
+    let dir = path.dirname(filePath);
+    while (dir && dir !== userWorkspace && dir !== BASE_WORKSPACE && dir.startsWith(userWorkspace)) {
+      await fs.chmod(dir, 0o777);
+      dir = path.dirname(dir);
+    }
+
     await fs.writeFile(filePath, content || '', 'utf8');
     session.previewVersion = (session.previewVersion || 0) + 1;
     res.json({ success: true, filename: safePath });
@@ -256,12 +268,14 @@ app.get('/sessions/:id/packages', authenticateREST, async (req, res) => {
   if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
 
   const userWorkspace = path.join(BASE_WORKSPACE, session.userId);
+  const projectName = req.query.projectName;
+  const projectPath = projectName ? path.join(userWorkspace, projectName) : userWorkspace;
   
   try {
     const packages = { npm: [], pip: [] };
 
     // Read npm packages from package.json
-    const pkgJsonPath = path.join(userWorkspace, 'package.json');
+    const pkgJsonPath = path.join(projectPath, 'package.json');
     if (fs.existsSync(pkgJsonPath)) {
       const pkg = await fs.readJson(pkgJsonPath);
       const deps = { ...pkg.dependencies, ...pkg.devDependencies };

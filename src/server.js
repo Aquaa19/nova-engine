@@ -512,7 +512,17 @@ wss.on('connection', (ws, request) => {
   
   session.lastActiveTime = Date.now();
 
-  const ptyProcess = pty.spawn('docker', ['exec', '-it', session.containerId, '/bin/bash'], { cols: 80, rows: 24 });
+  const url = new URL(request.url, 'http://localhost');
+  const project = url.searchParams.get('project');
+  let workdir = '/workspace';
+  if (project) {
+    const safeProject = project.replace(/[^a-zA-Z0-9_\-]+/g, '');
+    if (safeProject) {
+      workdir = `/workspace/${safeProject}`;
+    }
+  }
+
+  const ptyProcess = pty.spawn('docker', ['exec', '-it', '-w', workdir, session.containerId, '/bin/bash'], { cols: 80, rows: 24 });
   session.ptyProcess = ptyProcess;
 
   ptyProcess.onData(data => ws.send(JSON.stringify({ type: 'output', data })));

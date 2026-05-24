@@ -200,6 +200,31 @@ app.post('/sessions/:id/upload', authenticateREST, async (req, res) => {
   }
 });
 
+app.delete('/sessions/:id/files', authenticateREST, async (req, res) => {
+  const { id } = req.params;
+  const { filename } = req.body;
+  const session = activeSessions[id];
+  
+  if (!session || session.userId !== req.user.userId) return res.status(404).json({ error: 'Session not found' });
+  if (!filename || filename.includes('..') || path.isAbsolute(filename)) return res.status(400).json({ error: 'Invalid filename' });
+
+  const safePath = path.normalize(filename).replace(/^(\.\.[\/\\])+/, '');
+  if (!/^[a-zA-Z0-9_\-\.\/]+$/.test(safePath)) return res.status(400).json({ error: 'Invalid filename characters' });
+
+  const userWorkspace = path.join(BASE_WORKSPACE, session.userId);
+  const filePath = path.join(userWorkspace, safePath);
+
+  try {
+    if (await fs.exists(filePath)) {
+      await fs.remove(filePath);
+      session.previewVersion = (session.previewVersion || 0) + 1;
+    }
+    res.json({ success: true, filename: safePath });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete file from host map' });
+  }
+});
+
 app.post('/sessions/:id/format', authenticateREST, async (req, res) => {
   const { id } = req.params;
   const { filename, language } = req.body;

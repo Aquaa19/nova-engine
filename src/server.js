@@ -124,7 +124,8 @@ app.post('/sessions', authenticateREST, (req, res) => {
   const CONTAINER_PIDS = process.env.CONTAINER_PIDS_LIMIT || '50';
 
   try {
-    const cmd = `docker run -d --name ${containerId} --rm --memory=${CONTAINER_MEMORY} --memory-swap=${CONTAINER_MEMORY} --cpus=${CONTAINER_CPUS} --pids-limit=${CONTAINER_PIDS} --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${hostWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
+    const network = process.env.DOCKER_NETWORK || 'bridge';
+    const cmd = `docker run -d --name ${containerId} --network ${network} --rm --memory=${CONTAINER_MEMORY} --memory-swap=${CONTAINER_MEMORY} --cpus=${CONTAINER_CPUS} --pids-limit=${CONTAINER_PIDS} --read-only --tmpfs /tmp:rw,size=50m,mode=1777 --tmpfs /home/student:rw,size=10m,mode=1777 -e PYTHONPATH=/workspace/.python_packages -e PIP_TARGET=/workspace/.python_packages -v ${hostWorkspace}:/workspace -w /workspace nova-engine-sandbox sleep 7200`;
     
     const startSpawn = Date.now();
     if (process.env.NODE_ENV !== 'test') {
@@ -399,6 +400,43 @@ app.get('/sessions/:id/preview/*', async (req, res) => {
   } else {
     res.sendFile(filePath);
   }
+});
+
+app.all('/sessions/:id/proxy/:port/*', (req, res) => {
+  const { id, port } = req.params;
+  const session = activeSessions[id];
+  if (!session) return res.status(404).send('<h2>Sandbox Offline</h2>');
+
+  const reqPath = req.params[0] || '';
+  const queryStr = req.url.split('?')[1] || '';
+  const destPath = '/' + reqPath + (queryStr ? '?' + queryStr : '');
+  const targetHost = session.containerId;
+
+  const options = {
+    hostname: targetHost,
+    port: parseInt(port, 10),
+    path: destPath,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: `${targetHost}:${port}`
+    }
+  };
+
+  delete options.headers['x-auth-token'];
+  delete options.headers['x-user-id'];
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res, { end: true });
+  });
+
+  proxyReq.on('error', (err) => {
+    log('error', 'Proxy request failed', { sessionId: id, port, path: destPath, error: err.message });
+    res.status(502).send(`<h2>Proxy Connection Failed</h2><p>Could not connect to service on port ${port} inside the sandbox container. Make sure your server is running.</p>`);
+  });
+
+  req.pipe(proxyReq, { end: true });
 });
 
 app.get('/sessions/:id/livereload', (req, res) => {

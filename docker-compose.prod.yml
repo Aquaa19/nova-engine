@@ -15,6 +15,9 @@ services:
       - CONTAINER_CPUS=0.5
       - CONTAINER_PIDS_LIMIT=50
       - HOST_WORKSPACE_DIR=/home/ubuntu/nova-engine/workspace
+      - DOCKER_NETWORK=nova-net
+    networks:
+      - nova-net
     volumes:
       # Mount the Docker socket so the engine can manage sandbox containers on the host
       - /var/run/docker.sock:/var/run/docker.sock
@@ -24,3 +27,7 @@ services:
     group_add:
       - "0"
     restart: unless-stopped
+
+networks:
+  nova-net:
+    name: nova-net

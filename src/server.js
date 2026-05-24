@@ -87,7 +87,11 @@ const authenticateREST = (req, res, next) => {
 
   try {
     if (token === 'nova-super-secret-token') {
-      req.user = { userId: 'local-student' };
+      const localUserId = req.headers['x-user-id'] || req.query.localUserId || 'local-student';
+      if (!/^[a-zA-Z0-9_\-]+$/.test(localUserId)) {
+        return res.status(400).json({ error: 'Invalid user identifier' });
+      }
+      req.user = { userId: localUserId };
     } else {
       req.user = jwt.verify(token, JWT_SECRET);
     }
@@ -446,7 +450,16 @@ server.on('upgrade', (request, socket, head) => {
   if (!token) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); return socket.destroy(); }
 
   try {
-    request.user = token === 'nova-super-secret-token' ? { userId: 'local-student' } : jwt.verify(token, JWT_SECRET);
+    if (token === 'nova-super-secret-token') {
+      const localUserId = url.searchParams.get('localUserId') || request.headers['x-user-id'] || 'local-student';
+      if (!/^[a-zA-Z0-9_\-]+$/.test(localUserId)) {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        return socket.destroy();
+      }
+      request.user = { userId: localUserId };
+    } else {
+      request.user = jwt.verify(token, JWT_SECRET);
+    }
     request.sessionId = match[1];
     wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
   } catch (err) {
